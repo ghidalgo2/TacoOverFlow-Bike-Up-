@@ -1,0 +1,360 @@
+package com.example.mapapps;
+
+import android.Manifest;
+import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.location.Location;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.util.Log;
+import android.widget.Toast;
+
+import androidx.annotation.NonNull;
+import androidx.core.app.ActivityCompat;
+import androidx.fragment.app.FragmentActivity;
+
+import com.example.mapapps.databinding.ActivityMapsBinding;
+import com.google.android.gms.location.*;
+import com.google.android.gms.maps.*;
+import com.google.android.gms.maps.model.*;
+import com.google.android.gms.maps.model.JointType;
+
+import android.content.IntentSender;
+import com.google.android.gms.common.api.ResolvableApiException;
+import com.google.android.gms.location.LocationSettingsRequest;
+import com.google.android.gms.location.LocationSettingsResponse;
+import com.google.android.gms.location.SettingsClient;
+import com.google.android.gms.tasks.OnFailureListener;
+import com.google.android.gms.tasks.OnSuccessListener;
+
+import java.util.ArrayList;
+import java.util.List;
+
+public class MapsActivity extends FragmentActivity implements OnMapReadyCallback {
+
+    private final List<LatLng> pathPoints = new ArrayList<>();
+    private Polyline polyline;
+    private GoogleMap mMap;
+    private ActivityMapsBinding binding;
+    private FusedLocationProviderClient fusedLocationClient;
+    private LocationCallback locationCallback;
+    private Location lastLocation = null;
+    private double totalDistance = 0;
+    private static final int LOCATION_PERMISSION_REQUEST = 1001;
+    private static final int GPS_REQUEST_CODE = 101;
+    private boolean isTracking = false;
+    private boolean isPaused = false;
+
+    private long startTime = 0L;
+    private long pausedTime = 0L;
+    private Handler timerHandler = new Handler();
+    private Runnable timerRunnable;
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        binding = ActivityMapsBinding.inflate(getLayoutInflater());
+        setContentView(binding.getRoot());
+
+        // Set up map fragment
+        SupportMapFragment mapFragment = (SupportMapFragment) getSupportFragmentManager()
+                .findFragmentById(R.id.map);
+        if (mapFragment == null) {
+            Log.e("MAP_DEBUG", "❌ mapFragment is NULL");
+        } else {
+            Log.d("MAP_DEBUG", "✅ mapFragment is FOUND. Calling getMapAsync...");
+            mapFragment.getMapAsync(this);
+        }
+
+        fusedLocationClient = LocationServices.getFusedLocationProviderClient(this);
+
+        binding.startButton.setOnClickListener(v -> {
+            if (!isTracking) {
+                isTracking = true;
+                isPaused = false;
+                startTime = System.currentTimeMillis();
+                startLocationUpdates();
+                startTimer();
+                Toast.makeText(this, "Tracking started", Toast.LENGTH_SHORT).show();
+            } else if (isPaused) {
+                isPaused = false;
+                startTime += System.currentTimeMillis() - pausedTime;
+                startLocationUpdates();
+                startTimer();
+                Toast.makeText(this, "Resumed", Toast.LENGTH_SHORT).show();
+            }
+        });
+
+        binding.pauseButton.setOnClickListener(v -> {
+            if (isTracking && !isPaused) {
+                isPaused = true;
+                pausedTime = System.currentTimeMillis();
+                stopLocationUpdates();
+                stopTimer();
+                Toast.makeText(this, "Paused", Toast.LENGTH_SHORT).show();
+            }
+        });
+
+
+        binding.stopButton.setOnClickListener(v -> {
+            if (isTracking) {
+                isTracking = false;
+                isPaused = false;
+                stopLocationUpdates();
+                stopTimer();
+
+                double miles = totalDistance / 1609.34;
+                String summary = "Session ended.\nTime: " + getFormattedTime() +
+                        "\nDistance: " + String.format("%.2f", miles) + " mi" +
+                        "\nCalories: " + getCaloriesBurned() + " cal" +
+                        "\nCO₂ Saved: " + String.format("%.2f", getCarbonEmissionsSaved()) + " grams";
+
+
+                Log.d("MAP_DEBUG", summary);
+                Toast.makeText(this, summary, Toast.LENGTH_LONG).show();
+
+                // Reset everything
+                totalDistance = 0;
+                lastLocation = null;
+                pathPoints.clear();
+                if (polyline != null) polyline.remove();
+                polyline = null;
+
+                // Reset UI
+                binding.timeText.setText("Time: 00:00");
+                binding.distanceText.setText("Distance: 0.00 mi");
+                binding.caloriesText.setText("Calories: 0");
+            }
+        });
+
+        binding.Profile.setOnClickListener(v -> {
+            Intent intent = new Intent(MapsActivity.this, MainActivity.class);
+            startActivity(intent);
+            finish(); // Optional: closes MapsActivity
+        });
+        binding.AI.setOnClickListener(v -> {
+            Intent intent = new Intent(MapsActivity.this, Screen1Activity.class);
+            startActivity(intent);
+        });
+
+        binding.BikeStart.setOnClickListener(v -> {
+            Intent intent = new Intent(MapsActivity.this, Screen2Activity.class);
+            startActivity(intent);
+        });
+
+        binding.LeaderBoard.setOnClickListener(v -> {
+            Intent intent = new Intent(MapsActivity.this, Screen3Activity.class);
+            startActivity(intent);
+        });
+
+    }
+
+    private void stopLocationUpdates() {
+        if (fusedLocationClient != null && locationCallback != null) {
+            fusedLocationClient.removeLocationUpdates(locationCallback);
+        }
+    }
+
+    @Override
+    public void onMapReady(GoogleMap googleMap) {
+        Log.d("MAP_DEBUG", "Map is ready");
+        mMap = googleMap;
+
+        // Check permissions before starting
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
+                != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(
+                    this,
+                    new String[]{Manifest.permission.ACCESS_FINE_LOCATION},
+                    LOCATION_PERMISSION_REQUEST
+            );
+            return;
+        }
+
+        mMap.setMyLocationEnabled(true);
+        startLocationUpdates();
+    }
+
+    private void startLocationUpdates() {
+        LocationRequest locationRequest = LocationRequest.create();
+        locationRequest.setInterval(5000); // Every 5 seconds
+        locationRequest.setFastestInterval(3000);
+        locationRequest.setPriority(Priority.PRIORITY_HIGH_ACCURACY);
+
+        LocationSettingsRequest settingsRequest = new LocationSettingsRequest.Builder()
+                .addLocationRequest(locationRequest)
+                .setAlwaysShow(true) // Important for showing the GPS enable dialog
+                .build();
+
+        SettingsClient settingsClient = LocationServices.getSettingsClient(this);
+        settingsClient.checkLocationSettings(settingsRequest)
+                .addOnSuccessListener(locationSettingsResponse -> {
+                    // All good: GPS is on
+                    Log.d("MAP_DEBUG", "✅ GPS is ON. Starting location updates.");
+
+                    locationCallback = new LocationCallback() {
+                        @Override
+                        public void onLocationResult(LocationResult result) {
+                            if (result == null) return;
+
+                            for (Location location : result.getLocations()) {
+                                updateTracking(location);
+                            }
+                        }
+                    };
+
+                    if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
+                            == PackageManager.PERMISSION_GRANTED) {
+                        fusedLocationClient.requestLocationUpdates(
+                                locationRequest,
+                                locationCallback,
+                                Looper.getMainLooper()
+                        );
+                    }
+                })
+                .addOnFailureListener(e -> {
+                    // GPS not enabled
+                    if (e instanceof ResolvableApiException) {
+                        try {
+                            ((ResolvableApiException) e).startResolutionForResult(
+                                    MapsActivity.this,
+                                    GPS_REQUEST_CODE
+                            );
+                        } catch (IntentSender.SendIntentException sendEx) {
+                            sendEx.printStackTrace();
+                        }
+                    } else {
+                        Toast.makeText(this, "GPS is required to track location", Toast.LENGTH_LONG).show();
+                    }
+                });
+    }
+
+
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+
+        if (requestCode == GPS_REQUEST_CODE) {
+            if (resultCode == RESULT_OK) {
+                // GPS turned on
+                Toast.makeText(this, "GPS enabled", Toast.LENGTH_SHORT).show();
+                startLocationUpdates(); // Try again
+            } else {
+                Toast.makeText(this, "GPS is required for this app", Toast.LENGTH_LONG).show();
+            }
+        }
+    }
+
+    private void startTimer() {
+        timerRunnable = new Runnable() {
+            @Override
+            public void run() {
+                if (!isPaused && isTracking) {
+                    binding.timeText.setText("Time: " + getFormattedTime());
+                    binding.caloriesText.setText("Calories: " + getCaloriesBurned());
+                    binding.CarbonSavedText.setText(
+                            String.format("Grams of CO₂ Saved: %.2f", getCarbonEmissionsSaved()));
+                    timerHandler.postDelayed(this, 1000); // run every second
+                }
+            }
+        };
+        timerHandler.post(timerRunnable);
+    }
+
+    private void stopTimer() {
+        timerHandler.removeCallbacks(timerRunnable);
+    }
+
+    private String getFormattedTime() {
+        long elapsed = System.currentTimeMillis() - startTime;
+        int seconds = (int) (elapsed / 1000);
+        int minutes = seconds / 60;
+        seconds = seconds % 60;
+        return String.format("%02d:%02d", minutes, seconds);
+    }
+
+
+    private void updateTracking(Location location) {
+        LatLng currentLatLng = new LatLng(location.getLatitude(), location.getLongitude());
+
+        if(polyline == null) {
+            polyline = mMap.addPolyline(new PolylineOptions()
+                    .addAll(pathPoints)
+                    .width(10f)
+                    .color(0xFF00FF00) //green
+                    .jointType(JointType.ROUND)
+            );
+        } else {
+            pathPoints.add(currentLatLng);
+            polyline.setPoints(pathPoints);
+        }
+
+        if (lastLocation != null) {
+            float distance = lastLocation.distanceTo(location); // meters
+            totalDistance += distance;
+        }
+
+        lastLocation = location;
+
+        // Update camera position
+        mMap.moveCamera(CameraUpdateFactory.newLatLngZoom(currentLatLng, 17));
+
+        // Update distance in miles
+        double miles = totalDistance / 1609.34;
+        binding.distanceText.setText(String.format("Miles Traveled: %.2f", miles));
+    }
+
+    private int getCaloriesBurned() {
+        double MET = 60; // calories burned per mile
+        double miles = totalDistance / 1609.34;
+        return (int) (MET * miles);
+    }
+
+    private double getCarbonEmissionsSaved(){
+        double MET = 93.20567883560008; // grams CO2 per mile
+        double miles = totalDistance / 1609.34;
+        return (double) (MET * miles);
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        if (fusedLocationClient != null && locationCallback != null) {
+            fusedLocationClient.removeLocationUpdates(locationCallback);
+        }
+    }
+
+    public void onRequestPermissionsResult(int requestCode,
+                                           @NonNull String[] permissions,
+                                           @NonNull int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == LOCATION_PERMISSION_REQUEST) {
+            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                SupportMapFragment mapFragment = (SupportMapFragment) getSupportFragmentManager()
+                        .findFragmentById(R.id.map);
+                if (mapFragment != null) {
+                    mapFragment.getMapAsync(this); // Try again after permission granted
+                }
+            } else {
+                Toast.makeText(this, "Location permission required", Toast.LENGTH_SHORT).show();
+            }
+        }
+    }
+
+    private void saveSession(double miles, String time, int calories) {
+        String timestamp = java.text.DateFormat.getDateTimeInstance().format(new java.util.Date());
+
+        String entry = "Date: " + timestamp +
+                "\nTime: " + time +
+                "\nDistance: " + String.format("%.2f mi", miles) +
+                "\nCalories: " + calories + "\n Grams of C02 Saved:" + String.format("%.2f", getCarbonEmissionsSaved()) + "\n";
+
+        getSharedPreferences("run_sessions", MODE_PRIVATE)
+                .edit()
+                .putString("last_session", entry)
+                .apply();
+
+        Log.d("SESSION_LOG", "Saved session:\n" + entry);
+    }
+
+}
